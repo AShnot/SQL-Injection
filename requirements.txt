@@ -1,0 +1,9 @@
+pandas
+numpy
+scikit-learn
+sentence-transformers
+faiss-cpu
+nltk
+regex
+joblib
+
