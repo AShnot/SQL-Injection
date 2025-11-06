@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import unquote
 
+import sqlparse
+from sqlparse.sql import Token as SQLParseToken
+from sqlparse.tokens import Token as SQLParseTokenType
+
 from . import config
 from .logging_utils import get_logger
 
@@ -18,20 +22,6 @@ class Token:
     token_type: str
     start_char: int
     end_char: int
-
-
-SQL_TOKEN_REGEX = re.compile(
-    r"""
-    (?P<comment_multi>/\*.*?\*/)|
-    (?P<comment_single>--[^\n]*|#[^\n]*)|
-    (?P<string>'(?:''|\\'|[^'])*'|"(?:""|\\"|[^"])*")|
-    (?P<number>\b\d+(?:\.\d+)?\b)|
-    (?P<operator><>|!=|<=|>=|==|:=|[-+*/%=<>&|^!~]+)|
-    (?P<identifier>\b[a-zA-Z_][\w$]*\b)|
-    (?P<punctuation>[(),.;])
-    """,
-    re.IGNORECASE | re.DOTALL | re.VERBOSE,
-)
 
 
 def normalise_text(text: str) -> str:
@@ -49,25 +39,43 @@ def normalise_text(text: str) -> str:
     return text
 
 
+def _sqlparse_token_type(token: SQLParseToken) -> str:
+    """Return a simplified token type string for sqlparse tokens."""
+    ttype = token.ttype
+    if ttype is None:
+        if token.is_group:
+            return token.__class__.__name__.lower()
+        return "unknown"
+    if isinstance(ttype, SQLParseTokenType):
+        # sqlparse TokenType has a string-like repr ``Token.Keyword`` etc.
+        return str(ttype).split(".")[-1].lower()
+    # fallback for e.g. combined token types (tuples)
+    return ":".join(str(part).split(".")[-1].lower() for part in (ttype if isinstance(ttype, tuple) else (ttype,)))
+
+
 def lex_query(query: str) -> List[Token]:
-    """Tokenise the SQL query using a simple regex lexer."""
+    """Tokenise the SQL query using sqlparse for robust SQL-aware lexing."""
     tokens: List[Token] = []
-    idx = 0
-    length = len(query)
-    while idx < length:
-        match = SQL_TOKEN_REGEX.match(query, idx)
-        if match:
-            token_type = match.lastgroup or "unknown"
-            token_text = match.group(token_type)
-            start, end = match.span()
-            tokens.append(Token(token_text, token_type, start, end))
-            idx = end
-        else:
-            # treat the current character as whitespace/unknown token
-            next_idx = idx + 1
-            tokens.append(Token(query[idx:next_idx], "whitespace", idx, next_idx))
-            idx = next_idx
-    logger.debug("Lexed %d tokens", len(tokens))
+    try:
+        parsed = sqlparse.parse(query)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("sqlparse failed, falling back to character tokens: %s", exc)
+        return [Token(query, "unknown", 0, len(query))] if query else []
+
+    if not parsed:
+        return []
+
+    offset = 0
+    for tok in parsed[0].flatten():
+        text = str(tok)
+        if not text:
+            continue
+        start = offset
+        end = start + len(text)
+        offset = end
+        token_type = _sqlparse_token_type(tok)
+        tokens.append(Token(text, token_type, start, end))
+    logger.debug("Lexed %d tokens via sqlparse", len(tokens))
     return tokens
 
 

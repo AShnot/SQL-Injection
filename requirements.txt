@@ -6,4 +6,5 @@ faiss-cpu
 nltk
 regex
 joblib
+sqlparse
 
