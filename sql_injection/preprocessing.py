@@ -6,9 +6,8 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import unquote
 
-import sqlparse
-from sqlparse.sql import Token as SQLParseToken
-from sqlparse.tokens import Token as SQLParseTokenType
+from sqlglot import Tokenizer
+from sqlglot.errors import ParseError
 
 from . import config
 from .logging_utils import get_logger
@@ -39,44 +38,59 @@ def normalise_text(text: str) -> str:
     return text
 
 
-def _sqlparse_token_type(token: SQLParseToken) -> str:
-    """Return a simplified token type string for sqlparse tokens."""
-    ttype = token.ttype
-    if ttype is None:
-        if token.is_group:
-            return token.__class__.__name__.lower()
+_TOKENIZER = Tokenizer()
+
+
+def _sqlglot_token_type(token) -> str:
+    """Return a simplified token type string for sqlglot tokens."""
+    token_type = getattr(token, "token_type", None)
+    if token_type is None:
         return "unknown"
-    if isinstance(ttype, SQLParseTokenType):
-        # sqlparse TokenType has a string-like repr ``Token.Keyword`` etc.
-        return str(ttype).split(".")[-1].lower()
-    # fallback for e.g. combined token types (tuples)
-    return ":".join(str(part).split(".")[-1].lower() for part in (ttype if isinstance(ttype, tuple) else (ttype,)))
+    # sqlglot exposes enums with ``name`` / ``value`` attributes.
+    name = getattr(token_type, "name", None)
+    if name:
+        return str(name).lower()
+    value = getattr(token_type, "value", None)
+    if value is not None:
+        return str(value).lower()
+    return str(token_type).lower()
 
 
 def lex_query(query: str) -> List[Token]:
-    """Tokenise the SQL query using sqlparse for robust SQL-aware lexing."""
-    tokens: List[Token] = []
-    try:
-        parsed = sqlparse.parse(query)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("sqlparse failed, falling back to character tokens: %s", exc)
-        return [Token(query, "unknown", 0, len(query))] if query else []
-
-    if not parsed:
+    """Tokenise the SQL query using sqlglot for robust SQL-aware lexing."""
+    if not query:
         return []
 
+    raw_tokens: List[Token] = []
+    try:
+        parsed_tokens = _TOKENIZER.tokenize(query)
+    except (ParseError, ValueError) as exc:  # pragma: no cover - defensive
+        logger.warning("sqlglot failed to tokenise query, using fallback: %s", exc)
+        return [Token(query, "unknown", 0, len(query))]
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("Unexpected sqlglot failure, using fallback")
+        return [Token(query, "unknown", 0, len(query))]
+
     offset = 0
-    for tok in parsed[0].flatten():
-        text = str(tok)
+    for tok in parsed_tokens:
+        text = getattr(tok, "text", None) or ""
         if not text:
             continue
-        start = offset
-        end = start + len(text)
+        # sqlglot tokens provide span info in newer versions; fall back to search
+        span = getattr(tok, "span", None)
+        if span and len(span) == 2 and all(isinstance(x, int) for x in span):
+            start, end = span
+        else:
+            start = query.find(text, offset)
+            if start == -1:
+                start = offset
+            end = start + len(text)
         offset = end
-        token_type = _sqlparse_token_type(tok)
-        tokens.append(Token(text, token_type, start, end))
-    logger.debug("Lexed %d tokens via sqlparse", len(tokens))
-    return tokens
+        token_type = _sqlglot_token_type(tok)
+        raw_tokens.append(Token(text, token_type, int(start), int(end)))
+
+    logger.debug("Lexed %d tokens via sqlglot", len(raw_tokens))
+    return raw_tokens
 
 
 def iter_windows(tokens: Sequence[Token], window_size: int, stride: int) -> Iterable[Tuple[int, int, Sequence[Token]]]:
