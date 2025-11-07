@@ -20,18 +20,21 @@ IDS_FILE = EMBEDDINGS_DIR / "ids.npy"
 WINDOW_META_TEMPLATE = "{row_id}_windows_meta.json"
 WINDOW_EMBED_TEMPLATE = "{row_id}_windows.npy"
 TOKEN_META_TEMPLATE = "{row_id}_tokens.json"
-CENTROIDS_FILE = CENTROIDS_DIR / "centroids.pkl"
+
+CENTROIDS_JSON_FILE = CENTROIDS_DIR / "centroids.json"
+CLASS_INDEX_FILE = CENTROIDS_DIR / "class_index.faiss"
+
 THRESHOLDS_FILE = METRICS_DIR / "thresholds.json"
 VECTOR_META_FILE = MODELS_DIR / "vectorizer_meta.json"
 BAD_ROWS_FILE = MODELS_DIR / "bad_rows.csv"
 REPORT_FILE = METRICS_DIR / "report.json"
 RUN_LOG_FILE = LOGS_DIR / "run.log"
 
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-FALLBACK_MODEL_NAME = "sentence-transformers/paraphrase-MiniLM-L6-v2"
-WINDOW_TOKENS = 20
-WINDOW_STRIDE = 5
-BATCH_SIZE = 64
+MODEL_NAME = "sentence-transformers/distilbert-base-nli-stsb-mean-tokens"
+FALLBACK_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+WINDOW_TOKENS = 5
+WINDOW_STRIDE = 1
+BATCH_SIZE = 32
 NORMALIZE_EMBEDDINGS = True
 VALIDATION_SPLIT = 0.15
 TEST_SPLIT = 0.15

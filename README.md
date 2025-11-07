@@ -3,10 +3,10 @@
 This repository provides a centroid-based SQL injection detection workflow built on top of sentence-transformer embeddings. It covers
 
 * dataset validation and SQL-aware preprocessing;
-* embedding extraction for full queries and token windows;
+* embedding extraction for full queries plus dynamic local signatures;
 * centroid construction per attack technique with automatic threshold calibration;
-* inference with localisation of the suspicious fragment;
-* few-shot updates for newly observed attack techniques.
+* FAISS-backed nearest centroid search with 8-bit quantisation;
+* inference with localisation of the suspicious fragment and centroid hot-reload for new techniques.
 
 ## Project Structure
 
@@ -42,18 +42,17 @@ python inference.py --query "SELECT * FROM users WHERE id = 1"
 
 The command outputs a JSON structure containing the predicted label, technique, confidence, and the highlighted fragment most similar to the corresponding centroid.
 
-To register a new attack technique from a handful of examples, load `SQLInjectionDetector` from `inference.py` and call `add_new_technique(technique_name, samples)`; the updated centroids are persisted automatically.
+To register a new attack technique from a handful of examples, load `SQLInjectionDetector` from `inference.py` and call `add_new_technique(technique_name, samples)`; the updated centroids and FAISS index are persisted automatically.
 
 ## Artifacts
 
 Key generated files include:
 
 * `artifacts/embeddings/embeddings_full.npy` – embeddings for each query.
-* `artifacts/embeddings/windows/*` – per-query window embeddings and metadata.
-* `artifacts/centroids/centroids.pkl` – centroid vectors and statistics.
+* `artifacts/centroids/centroids.json` – class and position centroids with technique order.
+* `artifacts/centroids/class_index.faiss` – FAISS scalar-quantised index over class centroids.
 * `artifacts/metrics/thresholds.json` – calibrated detection thresholds.
-* `artifacts/metrics/report.json` – evaluation metrics on the test split.
 * `artifacts/logs/run.log` – run logs.
 
-A helper notebook `artifacts/analysis/validate_thresholds.ipynb` is provided to explore ROC/PR curves after training.
+The optional notebook `artifacts/analysis/validate_thresholds.ipynb` can be used to explore ROC/PR curves after training.
 

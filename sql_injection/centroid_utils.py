@@ -1,9 +1,12 @@
+"""Utilities for storing and retrieving dynamic centroids and FAISS indexes."""
+
 from __future__ import annotations
 
-import joblib
+import json
+from typing import Dict, Iterable, List
+
+import faiss  # type: ignore
 import numpy as np
-import pandas as pd
-from typing import Dict, Iterable, Tuple
 
 from . import config
 from .logging_utils import get_logger
@@ -11,87 +14,89 @@ from .logging_utils import get_logger
 logger = get_logger(__name__)
 
 
-def compute_centroids(df: pd.DataFrame, embeddings: np.ndarray) -> Dict[str, Dict[str, object]]:
-    """Compute centroids for each attack technique (label==1) and optional negative centroid."""
-    technique_centroids: Dict[str, Dict[str, object]] = {}
-
-    positives = df[df["label"] == 1]
-    if positives.empty:
-        logger.warning("No positive samples found for centroid computation.")
-        return technique_centroids
-
-    for technique, group in positives.groupby("attack_technique"):
-        rows = group["row_id"].to_numpy()
-        vectors = embeddings[rows]
-        centroid = vectors.mean(axis=0)
-        norm = np.linalg.norm(centroid)
-        if norm == 0:
-            logger.warning("Centroid for technique %s has zero norm, skipping", technique)
-            continue
-        centroid = centroid / norm
-        distances = 1 - np.dot(vectors, centroid)
-        technique_centroids[technique] = {
-            "centroid": centroid.astype(np.float32),
-            "n_examples": int(len(vectors)),
-            "mean_distance": float(distances.mean()),
-            "std_distance": float(distances.std()),
-        }
-        logger.info(
-            "Computed centroid for %s with %d examples", technique, len(vectors)
-        )
-
-    negatives = df[df["label"] == 0]
-    if not negatives.empty:
-        vectors = embeddings[negatives["row_id"].to_numpy()]
-        centroid = vectors.mean(axis=0)
-        norm = np.linalg.norm(centroid)
-        if norm > 0:
-            centroid = centroid / norm
-            technique_centroids["__negative__"] = {
-                "centroid": centroid.astype(np.float32),
-                "n_examples": int(len(vectors)),
-            }
-            logger.info("Stored global negative centroid")
-    return technique_centroids
-
-
-def save_centroids(centroids: Dict[str, Dict[str, object]]) -> None:
-    config.CENTROIDS_DIR.mkdir(parents=True, exist_ok=True)
-    joblib.dump(centroids, config.CENTROIDS_FILE)
-    logger.info("Saved centroids to %s", config.CENTROIDS_FILE)
-
-
-def load_centroids(path: str = None) -> Dict[str, Dict[str, object]]:
-    path = path or config.CENTROIDS_FILE
-    centroids = joblib.load(path)
-    return centroids
-
-
-def update_centroid(existing: Dict[str, Dict[str, object]], technique: str, embeddings: np.ndarray) -> Dict[str, Dict[str, object]]:
-    technique_entry = existing.get(technique)
-    new_centroid = embeddings.mean(axis=0)
-    norm = np.linalg.norm(new_centroid)
+def _unit_vector(vectors: np.ndarray) -> np.ndarray:
+    centroid = vectors.mean(axis=0)
+    norm = float(np.linalg.norm(centroid))
     if norm == 0:
         raise ValueError("Cannot create centroid from zero vectors")
-    new_centroid = new_centroid / norm
+    return (centroid / norm).astype(np.float32)
 
-    if technique_entry:
-        n_old = technique_entry.get("n_examples", len(embeddings))
-        centroid_old = technique_entry["centroid"]
-        n_new = len(embeddings)
-        combined = centroid_old * n_old + new_centroid * n_new
-        combined_norm = np.linalg.norm(combined)
-        if combined_norm == 0:
-            centroid_final = new_centroid
-        else:
-            centroid_final = combined / combined_norm
-        technique_entry["centroid"] = centroid_final.astype(np.float32)
-        technique_entry["n_examples"] = int(n_old + n_new)
-    else:
-        existing[technique] = {
-            "centroid": new_centroid.astype(np.float32),
-            "n_examples": int(len(embeddings)),
+
+def prepare_centroid_payload(
+    class_vectors: Dict[str, np.ndarray],
+    position_vectors: Dict[str, List[Dict[str, object]]],
+) -> Dict[str, Dict[str, object]]:
+    payload: Dict[str, Dict[str, object]] = {}
+    for technique, centroid in class_vectors.items():
+        payload[technique] = {
+            "class_centroid": centroid.astype(np.float32).tolist(),
+            "position_centroids": [
+                {"text": item["text"], "embedding": item["embedding"].astype(np.float32).tolist()}
+                for item in position_vectors.get(technique, [])
+            ],
         }
-    return existing
+    return payload
 
 
+def save_centroids_json(store: Dict[str, Dict[str, object]]) -> None:
+    config.CENTROIDS_DIR.mkdir(parents=True, exist_ok=True)
+    with config.CENTROIDS_JSON_FILE.open("w", encoding="utf-8") as f:
+        json.dump(store, f, indent=2)
+    logger.info("Saved centroid store to %s", config.CENTROIDS_JSON_FILE)
+
+
+def load_centroids_json() -> Dict[str, Dict[str, object]]:
+    with config.CENTROIDS_JSON_FILE.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build_class_index(vectors: Iterable[np.ndarray]) -> faiss.Index:
+    vector_list = list(vectors)
+    if not vector_list:
+        raise ValueError("No vectors provided to build the class index")
+    vectors_array = np.stack(vector_list).astype(np.float32)
+    dim = vectors_array.shape[1]
+    index = faiss.IndexScalarQuantizer(dim, faiss.ScalarQuantizer.QT_8bit, faiss.METRIC_INNER_PRODUCT)
+    index.train(vectors_array)
+    index.add(vectors_array)
+    return index
+
+
+def save_faiss_index(index: faiss.Index) -> None:
+    config.CENTROIDS_DIR.mkdir(parents=True, exist_ok=True)
+    faiss.write_index(index, str(config.CLASS_INDEX_FILE))
+    logger.info("Persisted FAISS class index to %s", config.CLASS_INDEX_FILE)
+
+
+def load_faiss_index() -> faiss.Index:
+    return faiss.read_index(str(config.CLASS_INDEX_FILE))
+
+
+def add_or_update_centroid(
+    store: Dict[str, Dict[str, object]],
+    technique: str,
+    class_embedding: np.ndarray,
+    position_embeddings: List[Dict[str, object]],
+) -> Dict[str, Dict[str, object]]:
+    entry = store.get(technique, {"position_centroids": []})
+    entry["class_centroid"] = class_embedding.astype(np.float32).tolist()
+    existing_positions = entry.get("position_centroids", [])
+    existing_positions.extend(
+        {"text": item["text"], "embedding": item["embedding"].astype(np.float32).tolist()}
+        for item in position_embeddings
+    )
+    entry["position_centroids"] = existing_positions
+    store[technique] = entry
+    return store
+
+
+__all__ = [
+    "_unit_vector",
+    "prepare_centroid_payload",
+    "save_centroids_json",
+    "load_centroids_json",
+    "build_class_index",
+    "save_faiss_index",
+    "load_faiss_index",
+    "add_or_update_centroid",
+]

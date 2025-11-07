@@ -1,10 +1,7 @@
-import html
 import json
-import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib.parse import unquote
 
 from sqlglot import Tokenizer
 from sqlglot.errors import ParseError
@@ -24,18 +21,13 @@ class Token:
 
 
 def normalise_text(text: str) -> str:
-    """Apply light-weight normalisation keeping SQL semantics intact."""
+    """Lowercase + NFKC normalisation with null byte removal."""
     if text is None:
         return ""
-    original = text
-    text = text.replace("\x00", "")
-    text = html.unescape(text)
-    text = unquote(text)
-    text = unicodedata.normalize("NFKC", text)
-    # Collapse whitespace but preserve single spaces
-    text = re.sub(r"\s+", " ", text.strip())
-    logger.debug("Normalised text from %r to %r", original[:50], text[:50])
-    return text
+    cleaned = text.replace("\x00", "")
+    cleaned = unicodedata.normalize("NFKC", cleaned)
+    cleaned = cleaned.lower()
+    return cleaned
 
 
 _TOKENIZER = Tokenizer()

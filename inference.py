@@ -3,16 +3,17 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
-import joblib
+import faiss  # type: ignore
 import numpy as np
 
 from sql_injection import config
 from sql_injection.embedding_manager import EmbeddingManager
 from sql_injection.logging_utils import get_logger
+from sql_injection.pipeline import register_new_attack
 from sql_injection.preprocessing import iter_windows, lex_query, normalise_text, window_metadata
+from sql_injection.thresholds import ThresholdResult
 
 logger = get_logger(__name__)
 
@@ -23,7 +24,7 @@ class Prediction:
     label: int
     predicted_type: Optional[str]
     confidence: float
-    centroid_distance: float
+    centroid_similarity: float
     matched_window: Optional[Dict[str, object]]
 
     def to_dict(self) -> Dict[str, object]:
@@ -32,116 +33,169 @@ class Prediction:
             "label": self.label,
             "predicted_type": self.predicted_type,
             "confidence": self.confidence,
-            "centroid_distance": self.centroid_distance,
+            "centroid_similarity": self.centroid_similarity,
             "matched_window": self.matched_window,
         }
 
 
 class SQLInjectionDetector:
+    span_threshold: float = 0.85
+
     def __init__(self, device: Optional[str] = None):
         metadata = EmbeddingManager.load_metadata()
         self.manager = EmbeddingManager(model_name=metadata["model_name"], device=device)
-        self.thresholds = self._load_thresholds()
-        self.centroids = self._load_centroids()
         self.window_tokens = metadata.get("window_tokens", config.WINDOW_TOKENS)
         self.window_stride = metadata.get("window_stride", config.WINDOW_STRIDE)
-        logger.info("Detector initialised with threshold %.4f", self.thresholds["detection_threshold"])
+        self.thresholds = self._load_thresholds()
+        self.store = self._load_store()
+        self.technique_order = self.store.get("__order__", [])
+        self.position_lookup = self._prepare_position_lookup(self.store)
+        self.class_index = self._load_faiss_index()
 
-    def _load_thresholds(self) -> Dict[str, float]:
+    def _load_thresholds(self) -> ThresholdResult:
         with config.THRESHOLDS_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return ThresholdResult(**data)
+
+    def _load_store(self) -> Dict[str, Dict[str, object]]:
+        with config.CENTROIDS_JSON_FILE.open("r", encoding="utf-8") as f:
             return json.load(f)
 
-    def _load_centroids(self) -> Dict[str, Dict[str, object]]:
-        return joblib.load(config.CENTROIDS_FILE)
+    def _prepare_position_lookup(
+        self, store: Dict[str, Dict[str, object]]
+    ) -> Dict[str, Dict[str, object]]:
+        lookup: Dict[str, Dict[str, object]] = {}
+        for name, data in store.items():
+            if name.startswith("__"):
+                continue
+            entries: List[Dict[str, object]] = data.get("position_centroids", [])  # type: ignore[arg-type]
+            if not entries:
+                continue
+            texts = [item.get("text", "") for item in entries]
+            vectors = np.array([item.get("embedding", []) for item in entries], dtype=np.float32)
+            if vectors.size == 0:
+                continue
+            lookup[name] = {"texts": texts, "embeddings": vectors}
+        return lookup
+
+    def _load_faiss_index(self) -> faiss.Index:
+        try:
+            index = faiss.read_index(str(config.CLASS_INDEX_FILE))
+            if not self.technique_order:
+                self.technique_order = [name for name in self.store.keys() if not name.startswith("__")]
+            return index
+        except (faiss.FaissException, OSError, ValueError):
+            logger.warning("FAISS index missing; rebuilding from centroid store")
+            if not self.technique_order:
+                self.technique_order = [name for name in self.store.keys() if not name.startswith("__")]
+            vectors = [
+                np.array(self.store[name]["class_centroid"], dtype=np.float32)
+                for name in self.technique_order
+            ]
+            if not vectors:
+                raise RuntimeError("No centroids available to rebuild the FAISS index")
+            dim = vectors[0].shape[0]
+            index = faiss.IndexScalarQuantizer(dim, faiss.ScalarQuantizer.QT_8bit, faiss.METRIC_INNER_PRODUCT)
+            vectors_array = np.stack(vectors).astype(np.float32)
+            index.train(vectors_array)
+            index.add(vectors_array)
+            faiss.write_index(index, str(config.CLASS_INDEX_FILE))
+            return index
 
     def predict(self, full_query: str) -> Prediction:
         normalized = normalise_text(full_query)
         embedding = self.manager.encode([normalized])[0]
-        techniques = [k for k in self.centroids.keys() if k != "__negative__"]
-        if not techniques:
-            logger.warning("No centroids available. Returning negative prediction by default.")
-            return Prediction(full_query=full_query, label=0, predicted_type=None, confidence=0.0, centroid_distance=0.0, matched_window=None)
+        if not self.technique_order:
+            return Prediction(full_query, 0, None, 0.0, 0.0, None)
 
-        centroid_matrix = np.stack([self.centroids[t]["centroid"] for t in techniques])
-        similarities = centroid_matrix @ embedding
-        best_idx = int(np.argmax(similarities))
-        best_sim = float(similarities[best_idx])
-        best_type = techniques[best_idx]
-        label = int(best_sim >= self.thresholds["detection_threshold"])
-        matched_window = None
-        if label == 1:
-            matched_window = self._localise_span(normalized, best_type)
+        sims, indices = self.class_index.search(np.expand_dims(embedding, axis=0), 1)
+        score = float(sims[0][0]) if sims.size else 0.0
+        idx = int(indices[0][0]) if indices.size else -1
+        predicted = self.technique_order[idx] if 0 <= idx < len(self.technique_order) else None
+        label = int(score >= self.thresholds.detection_threshold)
+
+        matched = None
+        if label == 1 and predicted:
+            matched = self._localise_span(full_query, normalized, predicted)
+
         return Prediction(
             full_query=full_query,
             label=label,
-            predicted_type=best_type if label else None,
-            confidence=best_sim,
-            centroid_distance=best_sim,
-            matched_window=matched_window,
+            predicted_type=predicted if label else None,
+            confidence=score,
+            centroid_similarity=score,
+            matched_window=matched,
         )
 
-    def _localise_span(self, normalized: str, technique: str) -> Optional[Dict[str, object]]:
-        tokens = lex_query(normalized)
-        windows = []
+    def _localise_span(
+        self, original_query: str, normalized_query: str, technique: str
+    ) -> Optional[Dict[str, object]]:
+        reference = self.position_lookup.get(technique)
+        if not reference:
+            return None
+
+        tokens = lex_query(normalized_query)
+        windows: List[Dict[str, object]] = []
+        texts: List[str] = []
         for _, _, token_window in iter_windows(tokens, self.window_tokens, self.window_stride):
-            meta = window_metadata(token_window, normalized)
-            if meta["text"]:
-                windows.append(meta)
+            meta = window_metadata(token_window, normalized_query)
+            if not meta["text"]:
+                continue
+            meta = dict(meta)
+            meta["text"] = original_query[meta["start_char"] : meta["end_char"]]
+            windows.append(meta)
+            texts.append(meta.get("text", ""))
         if not windows:
             return None
-        embeddings = self.manager.encode([w["text"] for w in windows])
-        centroid = self.centroids[technique]["centroid"]
-        sims = embeddings @ centroid
-        idx = int(np.argmax(sims))
-        best = windows[idx]
-        best["window_score"] = float(sims[idx])
+
+        embeddings = self.manager.encode([normalise_text(text) for text in texts])
+        position_vectors = reference["embeddings"]
+        sims = embeddings @ position_vectors.T
+        best_scores = sims.max(axis=1)
+
+        candidates = []
+        for meta, score in zip(windows, best_scores):
+            entry = dict(meta)
+            entry["window_score"] = float(score)
+            if score >= self.span_threshold:
+                candidates.append(entry)
+
+        if not candidates:
+            best_idx = int(np.argmax(best_scores))
+            fallback = dict(windows[best_idx])
+            fallback["window_score"] = float(best_scores[best_idx])
+            return fallback
+
+        candidates.sort(key=lambda item: item["start_char"])
+        merged: List[Dict[str, object]] = []
+        current = candidates[0]
+        for candidate in candidates[1:]:
+            if candidate["start_char"] <= current["end_char"]:
+                current["end_char"] = max(current["end_char"], candidate["end_char"])
+                current["window_score"] = max(current["window_score"], candidate["window_score"])
+                current["text"] = original_query[current["start_char"] : current["end_char"]]
+            else:
+                current["text"] = original_query[current["start_char"] : current["end_char"]]
+                merged.append(current)
+                current = candidate
+        current["text"] = original_query[current["start_char"] : current["end_char"]]
+        merged.append(current)
+
+        best = max(merged, key=lambda item: item["window_score"])
         return best
 
-    def add_new_technique(self, technique: str, samples: list[str]) -> None:
-        """Add or update a centroid using a small number of labelled examples."""
-        if not samples:
-            raise ValueError("No samples provided for the new technique")
-        normalized_samples = [normalise_text(sample) for sample in samples]
-        embeddings = self.manager.encode(normalized_samples)
-        centroid = embeddings.mean(axis=0)
-        norm = float(np.linalg.norm(centroid))
-        if norm == 0:
-            raise ValueError("Cannot create centroid from zero vectors")
-        centroid = centroid / norm
-        entry = self.centroids.get(technique)
-        if entry:
-            n_old = entry.get("n_examples", 0)
-            combined = entry["centroid"] * n_old + centroid * len(samples)
-            combined_norm = np.linalg.norm(combined)
-            combined = combined / combined_norm if combined_norm else centroid
-            entry["centroid"] = combined.astype(np.float32)
-            entry["n_examples"] = int(n_old + len(samples))
-        else:
-            self.centroids[technique] = {
-                "centroid": centroid.astype(np.float32),
-                "n_examples": int(len(samples)),
-            }
-        final_centroid = self.centroids[technique]["centroid"]
-        overlaps = []
-        for name, data in self.centroids.items():
-            if name == technique or name == "__negative__":
-                continue
-            overlaps.append(float(np.dot(final_centroid, data["centroid"])))
-        if overlaps and max(overlaps) > 0.95:
-            logger.warning(
-                "New centroid %s is highly similar to an existing technique (similarity=%.4f)",
-                technique,
-                max(overlaps),
-            )
-        joblib.dump(self.centroids, config.CENTROIDS_FILE)
-        logger.info("Registered/updated centroid for %s with %d samples", technique, len(samples))
-
+    def add_new_technique(self, technique: str, examples: List[tuple[str, str]]) -> None:
+        register_new_attack(technique, examples, self.manager)
+        self.store = self._load_store()
+        self.technique_order = self.store.get("__order__", [])
+        self.position_lookup = self._prepare_position_lookup(self.store)
+        self.class_index = self._load_faiss_index()
 
 
 def cli() -> None:
-    parser = argparse.ArgumentParser(description="SQL Injection detector inference")
-    parser.add_argument("--query", required=True, help="Full SQL query to analyse")
-    parser.add_argument("--device", default=None, help="Device for sentence transformer (cpu/cuda)")
+    parser = argparse.ArgumentParser(description="SQL injection detector")
+    parser.add_argument("--query", required=True, help="SQL query to analyse")
+    parser.add_argument("--device", default=None, help="Torch device for embeddings")
     args = parser.parse_args()
 
     detector = SQLInjectionDetector(device=args.device)
@@ -151,4 +205,3 @@ def cli() -> None:
 
 if __name__ == "__main__":
     cli()
-

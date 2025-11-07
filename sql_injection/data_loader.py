@@ -58,6 +58,7 @@ def load_dataset(path: str = None) -> pd.DataFrame:
     df = df.reset_index(drop=True)
     df["row_id"] = df.index.astype(int)
     df["normalized_query"] = df["full_query"].map(normalise_text)
+    df["normalized_user_input"] = df["user_inputs"].map(normalise_text)
 
     config.TOKEN_METADATA_DIR.mkdir(parents=True, exist_ok=True)
     for _, row in df.iterrows():

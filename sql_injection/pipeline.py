@@ -1,31 +1,40 @@
+"""Training pipeline for dynamic centroid + local signature detector."""
+
 from __future__ import annotations
 
-import json
+from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from sklearn import metrics
 
 from . import config
-from .centroid_utils import compute_centroids, save_centroids
+from .centroid_utils import (
+    _unit_vector,
+    add_or_update_centroid,
+    build_class_index,
+    prepare_centroid_payload,
+    save_centroids_json,
+    save_faiss_index,
+    load_centroids_json,
+)
 from .data_loader import load_dataset
 from .embedding_manager import EmbeddingManager
 from .logging_utils import get_logger
-from .preprocessing import iter_windows, window_metadata, lex_query
+from .preprocessing import iter_windows, lex_query, normalise_text, window_metadata
 from .thresholds import ThresholdResult, calibrate_detection_threshold, save_thresholds
 
 logger = get_logger(__name__)
 
 
+@dataclass
 class TrainingArtifacts:
-    def __init__(self, embeddings: np.ndarray, ids: np.ndarray, centroids: Dict[str, Dict[str, object]], thresholds: ThresholdResult, report: Dict[str, object]):
-        self.embeddings = embeddings
-        self.ids = ids
-        self.centroids = centroids
-        self.thresholds = thresholds
-        self.report = report
+    embeddings: np.ndarray
+    ids: np.ndarray
+    centroids: Dict[str, Dict[str, object]]
+    faiss_index_built: bool
+    thresholds: ThresholdResult
 
 
 def ensure_directories() -> None:
@@ -36,9 +45,6 @@ def ensure_directories() -> None:
         config.MODELS_DIR,
         config.METRICS_DIR,
         config.LOGS_DIR,
-        config.ANALYSIS_DIR,
-        config.WINDOW_EMBEDDINGS_DIR,
-        config.TOKEN_METADATA_DIR,
     ]:
         path.mkdir(parents=True, exist_ok=True)
 
@@ -51,15 +57,14 @@ def split_dataset(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Data
         random_state=config.RANDOM_STATE,
         stratify=stratify_key,
     )
-    stratify_key_train = train_val["label"].astype(str) + "_" + train_val["attack_technique"].astype(str)
     val_size = config.VALIDATION_SPLIT / (1 - config.TEST_SPLIT)
+    stratify_key_train = train_val["label"].astype(str) + "_" + train_val["attack_technique"].astype(str)
     train, val = train_test_split(
         train_val,
         test_size=val_size,
         random_state=config.RANDOM_STATE,
         stratify=stratify_key_train,
     )
-    logger.info("Dataset split: train=%d, val=%d, test=%d", len(train), len(val), len(test))
     return train.sort_index(), val.sort_index(), test.sort_index()
 
 
@@ -69,143 +74,95 @@ def build_embeddings(df: pd.DataFrame, manager: EmbeddingManager) -> np.ndarray:
     config.EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
     np.save(config.EMBEDDINGS_FILE, embeddings.astype(np.float32))
     np.save(config.IDS_FILE, df["row_id"].to_numpy(dtype=np.int32))
-    logger.info("Saved full-query embeddings with shape %s", embeddings.shape)
     return embeddings
 
 
-def build_window_embeddings(df: pd.DataFrame, manager: EmbeddingManager) -> None:
-    for _, row in df.iterrows():
-        row_id = int(row["row_id"])
-        tokens = lex_query(row["normalized_query"])
-        windows = []
-        for start, end, token_window in iter_windows(tokens, config.WINDOW_TOKENS, config.WINDOW_STRIDE):
-            meta = window_metadata(token_window, row["normalized_query"])
-            if meta["text"]:
-                windows.append(meta)
-        if not windows:
+def _positive_grouped(train_df: pd.DataFrame, embeddings: np.ndarray) -> Dict[str, np.ndarray]:
+    positives = train_df[train_df["label"] == 1]
+    grouped: Dict[str, np.ndarray] = {}
+    for technique, group in positives.groupby("attack_technique"):
+        rows = group["row_id"].to_numpy()
+        vectors = embeddings[rows]
+        try:
+            grouped[technique] = _unit_vector(vectors)
+        except ValueError:
+            logger.warning("Skipping technique %s due to zero-norm centroid", technique)
+    return grouped
+
+
+def _collect_position_centroids(
+    df: pd.DataFrame, manager: EmbeddingManager
+) -> Dict[str, List[Dict[str, object]]]:
+    per_technique: Dict[str, List[Dict[str, object]]] = {}
+    for _, row in df[df["label"] == 1].iterrows():
+        technique = row["attack_technique"]
+        user_span = row.get("normalized_user_input", "")
+        if not user_span:
             continue
-        texts = [w["text"] for w in windows]
-        embeddings = manager.encode(texts)
-        path = config.WINDOW_EMBEDDINGS_DIR / config.WINDOW_EMBED_TEMPLATE.format(row_id=row_id)
-        config.WINDOW_EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
-        np.save(path, embeddings.astype(np.float32))
-        meta_path = config.WINDOW_EMBEDDINGS_DIR / config.WINDOW_META_TEMPLATE.format(row_id=row_id)
-        with meta_path.open("w", encoding="utf-8") as f:
-            json.dump(windows, f, indent=2, ensure_ascii=False)
-        logger.debug("Saved %d window embeddings for row %d", len(windows), row_id)
+        normalized_query = row["normalized_query"]
+        start = normalized_query.find(user_span)
+        if start == -1:
+            continue
+        end = start + len(user_span)
+        tokens = lex_query(normalized_query)
+        candidate_windows: List[Dict[str, object]] = []
+        for _, _, token_window in iter_windows(tokens, config.WINDOW_TOKENS, config.WINDOW_STRIDE):
+            meta = window_metadata(token_window, normalized_query)
+            if not meta["text"]:
+                continue
+            if meta["end_char"] <= start or meta["start_char"] >= end:
+                continue
+            candidate_windows.append(meta)
+        if not candidate_windows:
+            continue
+        embeddings = manager.encode([item["text"] for item in candidate_windows])
+        per_technique.setdefault(technique, [])
+        for meta, emb in zip(candidate_windows, embeddings):
+            per_technique[technique].append({"text": meta["text"], "embedding": emb})
+    return per_technique
 
 
-def compute_similarity_to_centroids(embeddings: np.ndarray, centroids: Dict[str, Dict[str, object]]) -> Tuple[np.ndarray, List[str]]:
-    techniques = [k for k in centroids.keys() if k != "__negative__"]
+def compute_thresholds(
+    df_val: pd.DataFrame,
+    centroids: Dict[str, np.ndarray],
+    embeddings: np.ndarray,
+) -> ThresholdResult:
+    techniques = list(centroids.keys())
     if not techniques:
-        return np.zeros(len(embeddings)), [""] * len(embeddings)
-    centroid_matrix = np.stack([centroids[t]["centroid"] for t in techniques])
-    sims = embeddings @ centroid_matrix.T
-    best_indices = sims.argmax(axis=1)
-    best_similarities = sims.max(axis=1)
-    best_labels = [techniques[idx] for idx in best_indices]
-    return best_similarities, best_labels
+        raise RuntimeError("No centroids available for threshold calibration")
+    matrix = np.stack([centroids[t] for t in techniques])
+    val_vectors = embeddings[df_val["row_id"].to_numpy()]
+    sims = val_vectors @ matrix.T
+    best = sims.max(axis=1)
+    return calibrate_detection_threshold(best, df_val["label"].to_numpy())
 
 
-def evaluate_localisation(df: pd.DataFrame, predictions: Dict[int, Dict[str, object]]) -> Dict[str, float]:
-    overlaps = []
-    for _, row in df.iterrows():
-        row_id = int(row["row_id"])
-        user_input = row.get("user_inputs", "")
-        if not user_input:
-            continue
-        pred = predictions.get(row_id)
-        if not pred:
-            continue
-        pred_span = pred.get("matched_window", {})
-        start = pred_span.get("start_char")
-        end = pred_span.get("end_char")
-        if start is None or end is None:
-            continue
-        full_query = row["normalized_query"]
-        gt_start = full_query.find(user_input)
-        if gt_start == -1:
-            continue
-        gt_end = gt_start + len(user_input)
-        inter_start = max(start, gt_start)
-        inter_end = min(end, gt_end)
-        intersection = max(0, inter_end - inter_start)
-        union = max(end, gt_end) - min(start, gt_start)
-        iou = intersection / union if union > 0 else 0.0
-        overlaps.append(iou)
-    if not overlaps:
-        return {}
-    return {
-        "mean_span_iou": float(np.mean(overlaps)),
-        "median_span_iou": float(np.median(overlaps)),
-        "exact_match_rate": float(np.mean([1 if o == 1.0 else 0 for o in overlaps])),
-    }
+def build_and_save_indexes(
+    centroids: Dict[str, np.ndarray],
+    positions: Dict[str, List[Dict[str, object]]],
+) -> Dict[str, Dict[str, object]]:
+    store = prepare_centroid_payload(centroids, positions)
+    if store:
+        order = sorted(store.keys())
+        store["__order__"] = order
+        save_centroids_json(store)
+        vectors = (np.array(store[name]["class_centroid"], dtype=np.float32) for name in order)
+        index = build_class_index(vectors)
+        save_faiss_index(index)
+    return store
 
 
-def evaluate_model(df_test: pd.DataFrame, embeddings: np.ndarray, centroids: Dict[str, Dict[str, object]], thresholds: ThresholdResult, manager: EmbeddingManager) -> Dict[str, object]:
-    sims, best_labels = compute_similarity_to_centroids(embeddings[df_test["row_id"].to_numpy()], centroids)
-    preds = (sims >= thresholds.detection_threshold).astype(int)
-    y_true = df_test["label"].to_numpy()
-    detection_metrics = {
-        "precision": metrics.precision_score(y_true, preds, zero_division=0),
-        "recall": metrics.recall_score(y_true, preds, zero_division=0),
-        "f1": metrics.f1_score(y_true, preds, zero_division=0),
-        "roc_auc": metrics.roc_auc_score(y_true, sims) if len(np.unique(y_true)) > 1 else float("nan"),
-    }
-
-    pos_mask = y_true == 1
-    typing_metrics = {}
-    if pos_mask.any():
-        true_types = df_test.loc[pos_mask, "attack_technique"].to_numpy()
-        pred_types = np.array(best_labels)[pos_mask]
-        typing_metrics = {
-            "accuracy": metrics.accuracy_score(true_types, pred_types),
-            "macro_f1": metrics.f1_score(true_types, pred_types, average="macro", zero_division=0),
-            "classification_report": metrics.classification_report(true_types, pred_types, output_dict=True, zero_division=0),
-        }
-
-    localisation_predictions = {}
-    for pos, (_, row) in enumerate(df_test.iterrows()):
-        row_id = int(row["row_id"])
-        if preds[pos] == 1:
-            technique = best_labels[pos]
-            localisation_predictions[row_id] = infer_window_for_row(
-                row, technique, centroids, manager
-            )
-
-    localisation_metrics = evaluate_localisation(
-        df_test[df_test["label"] == 1], localisation_predictions
-    )
-
-    report = {
-        "detection": detection_metrics,
-        "typing": typing_metrics,
-        "localisation": localisation_metrics,
-    }
-    with config.REPORT_FILE.open("w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2)
-    logger.info("Saved evaluation report to %s", config.REPORT_FILE)
-    return report
-
-
-def infer_window_for_row(row: pd.Series, technique: str, centroids: Dict[str, Dict[str, object]], manager: EmbeddingManager) -> Dict[str, object]:
-    if technique not in centroids:
-        return {}
-    tokens = lex_query(row["normalized_query"])
-    windows = []
-    for _, _, token_window in iter_windows(tokens, config.WINDOW_TOKENS, config.WINDOW_STRIDE):
-        meta = window_metadata(token_window, row["normalized_query"])
-        if meta["text"]:
-            windows.append(meta)
-    if not windows:
-        return {}
-    embeddings = manager.encode([w["text"] for w in windows])
-    centroid = centroids[technique]["centroid"]
-    sims = embeddings @ centroid
-    idx = int(np.argmax(sims))
-    best = windows[idx]
-    best["window_score"] = float(sims[idx])
-    return {"matched_window": best}
+def rebuild_faiss_from_store(store: Dict[str, Dict[str, object]]) -> None:
+    if not store:
+        return
+    order = store.get("__order__")
+    if not order:
+        order = sorted(name for name in store.keys() if not name.startswith("__"))
+    vectors = [np.array(store[name]["class_centroid"], dtype=np.float32) for name in order]
+    store["__order__"] = order
+    save_centroids_json(store)
+    index = build_class_index(vectors)
+    save_faiss_index(index)
 
 
 def train_pipeline(device: str | None = None) -> TrainingArtifacts:
@@ -214,24 +171,86 @@ def train_pipeline(device: str | None = None) -> TrainingArtifacts:
     manager.save_metadata()
 
     df = load_dataset()
-    train_df, val_df, test_df = split_dataset(df)
+    train_df, val_df, _ = split_dataset(df)
 
     embeddings = build_embeddings(df, manager)
-    build_window_embeddings(df, manager)
 
-    centroids = compute_centroids(train_df, embeddings)
-    save_centroids(centroids)
-    techniques = [k for k in centroids.keys() if k != "__negative__"]
-    if not techniques:
-        raise RuntimeError("No positive centroids computed. Ensure the dataset contains label==1 samples in training split.")
+    class_centroids = _positive_grouped(train_df, embeddings)
+    position_centroids = _collect_position_centroids(train_df, manager)
+    store = build_and_save_indexes(class_centroids, position_centroids)
 
-    val_embeddings = embeddings[val_df["row_id"].to_numpy()]
-    sims, _ = compute_similarity_to_centroids(val_embeddings, centroids)
-    thresholds = calibrate_detection_threshold(sims, val_df["label"].to_numpy())
+    if not class_centroids:
+        raise RuntimeError("No attack centroids computed; ensure positive samples are available")
+
+    thresholds = compute_thresholds(val_df, class_centroids, embeddings)
     save_thresholds(thresholds)
 
-    report = evaluate_model(test_df, embeddings, centroids, thresholds, manager)
+    return TrainingArtifacts(
+        embeddings=embeddings,
+        ids=df["row_id"].to_numpy(),
+        centroids=store,
+        faiss_index_built=bool(store),
+        thresholds=thresholds,
+    )
 
-    return TrainingArtifacts(embeddings, df["row_id"].to_numpy(), centroids, thresholds, report)
 
+def register_new_attack(
+    technique: str,
+    examples: List[Tuple[str, str]],
+    manager: EmbeddingManager,
+) -> Dict[str, Dict[str, object]]:
+    """Register a new attack type from few-shot examples.
+
+    Args:
+        technique: Name of the new technique.
+        examples: List of tuples ``(full_query, user_input)``.
+        manager: Embedding manager for vectorisation.
+    Returns:
+        Updated centroid store dictionary.
+    """
+
+    if not examples:
+        raise ValueError("At least one example is required to register a new attack")
+
+    normalized_queries = [normalise_text(query) for query, _ in examples]
+    query_embeddings = manager.encode(normalized_queries)
+    try:
+        class_centroid = _unit_vector(query_embeddings)
+    except ValueError as exc:
+        raise ValueError("Cannot compute centroid for the provided examples") from exc
+
+    position_embeddings: List[Dict[str, object]] = []
+    for (query, user_input) in examples:
+        normalized_query = normalise_text(query)
+        normalized_input = normalise_text(user_input)
+        if not normalized_input:
+            continue
+        start = normalized_query.find(normalized_input)
+        if start == -1:
+            continue
+        end = start + len(normalized_input)
+        tokens = lex_query(normalized_query)
+        windows: List[Dict[str, object]] = []
+        for _, _, token_window in iter_windows(tokens, config.WINDOW_TOKENS, config.WINDOW_STRIDE):
+            meta = window_metadata(token_window, normalized_query)
+            if not meta["text"]:
+                continue
+            if meta["end_char"] <= start or meta["start_char"] >= end:
+                continue
+            windows.append(meta)
+        if not windows:
+            continue
+        embeddings = manager.encode([meta["text"] for meta in windows])
+        for meta, embedding in zip(windows, embeddings):
+            position_embeddings.append({"text": meta["text"], "embedding": embedding})
+
+    try:
+        store = load_centroids_json()
+    except FileNotFoundError:
+        store = {}
+
+    store = add_or_update_centroid(store, technique, class_centroid, position_embeddings)
+    save_centroids_json(store)
+    rebuild_faiss_from_store(store)
+    return store
 
